@@ -87,5 +87,21 @@ services:
     ports:
       - "8080:8080"
 
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: on-failure
+
+  worker:
+    build:
+      context: ./v3/gateway-service
+    container_name: worker
+    command: rq worker --with-scheduler --url redis://redis:6379
+    depends_on:
+      - redis
+    environment:
+      RENTAL_SERVICE_URL: http://rental-service:8060
+      PAYMENT_SERVICE_URL: http://payment-service:8050
+
 volumes:
   db-data:

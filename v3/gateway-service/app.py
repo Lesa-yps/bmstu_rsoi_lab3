@@ -4,11 +4,12 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import requests
+from pydantic import BaseModel
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from queue_retry import retry_cancel_rental, retry_cancel_payment
 
 app = FastAPI(
     title="Car Rental System",
@@ -46,16 +47,16 @@ class PaginationResponse(BaseModel):
 
 
 class CarInfo(BaseModel):
-    carUid: UUID
-    brand: str
-    model: str
-    registrationNumber: str
+    carUid: UUID | None = None
+    brand: str | None = None
+    model: str | None = None
+    registrationNumber: str | None = None
 
 
 class PaymentInfo(BaseModel):
-    paymentUid: UUID
-    status: Literal["PAID", "CANCELED", "REVERSED"]
-    price: int
+    paymentUid: UUID | None = None
+    status: Literal["PAID", "CANCELED", "REVERSED"] | None = None
+    price: int | None = None
 
 
 class RentalResponse(BaseModel):
@@ -111,18 +112,18 @@ async def handle_http_error(request: Request, exc: HTTPException) -> JSONRespons
     return JSONResponse(status_code=exc.status_code, content={"message": exc.detail})
 
 
-def call_service(method: str, url: str, **kwargs: Any) -> requests.Response:
+def call_service(method: str, url: str, service_name: str = "A dependent service", **kwargs: Any) -> requests.Response:
     try:
         response = requests.request(method, url, timeout=5, **kwargs)
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail="A dependent service is unavailable") from exc
+        raise HTTPException(status_code=503, detail=f"{service_name} unavailable") from exc
 
     if response.status_code >= 400:
         try:
             body = response.json()
             detail = body.get("message", body.get("detail", response.text))
         except ValueError:
-            detail = response.text or "Dependent service request failed"
+            detail = response.text or f"{service_name} request failed"
         raise HTTPException(status_code=response.status_code, detail=detail)
 
     return response
@@ -131,26 +132,37 @@ def call_service(method: str, url: str, **kwargs: Any) -> requests.Response:
 def build_rental_response(rental: dict[str, Any]) -> dict[str, Any]:
     car_uid = rental["carUid"]
     payment_uid = rental["paymentUid"]
-    car = call_service("GET", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}").json()
-    payment = call_service(
-        "GET", f"{PAYMENT_SERVICE_URL}/internal/payments/{payment_uid}"
-    ).json()
+
+    try:
+        car = call_service("GET", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}", service_name="Car Service").json()
+        car_block = {
+            "carUid": str(car_uid),
+            "brand": car["brand"],
+            "model": car["model"],
+            "registrationNumber": car["registrationNumber"],
+        }
+    except HTTPException:
+        # fallback при недоступности некритичного сервиса
+        car_block = {} #{"carUid": str(car_uid)} 
+
+    try:
+        payment = call_service("GET", f"{PAYMENT_SERVICE_URL}/internal/payments/{payment_uid}", service_name="Payment Service").json()
+        payment_block = {
+            "paymentUid": str(payment_uid),
+            "status": payment["status"],
+            "price": payment["price"],
+        }
+    except HTTPException:
+        # fallback при недоступности некритичного сервиса
+        payment_block = {} #{"paymentUid": str(payment_uid)}
+
     return {
         "rentalUid": str(rental["rentalUid"]),
         "status": rental["status"],
         "dateFrom": str(rental["dateFrom"]).split("T", 1)[0],
         "dateTo": str(rental["dateTo"]).split("T", 1)[0],
-        "car": {
-            "carUid": str(car["carUid"]),
-            "brand": car["brand"],
-            "model": car["model"],
-            "registrationNumber": car["registrationNumber"],
-        },
-        "payment": {
-            "paymentUid": str(payment["paymentUid"]),
-            "status": payment["status"],
-            "price": payment["price"],
-        },
+        "car": car_block,
+        "payment": payment_block,
     }
 
 
@@ -175,6 +187,7 @@ def get_cars(
     response = call_service(
         "GET",
         f"{CAR_SERVICE_URL}/api/v1/cars",
+        service_name="Car Service",
         params={"page": max(page - 1, 0), "size": size, "showAll": showAll},
     ).json()
     response["page"] = page
@@ -185,6 +198,7 @@ def get_cars(
 @app.get(
     "/api/v1/rental",
     response_model=list[RentalResponse],
+    response_model_exclude_none=True,
     summary="Получить информацию о всех арендах пользователя",
     tags=["Gateway API"],
 )
@@ -194,6 +208,7 @@ def get_user_rentals(
     response = call_service(
         "GET",
         f"{RENTAL_SERVICE_URL}/api/v1/rental",
+        service_name="Rental Service",
         headers={"X-User-Name": x_user_name},
     ).json()
     return [build_rental_response(rental) for rental in response["items"]]
@@ -211,6 +226,7 @@ def create_rental(
     rental_data: CreateRentalRequest,
     x_user_name: str = Header(..., alias="X-User-Name"),
 ) -> dict[str, Any] | JSONResponse:
+    # проверка дат аренды
     if rental_data.dateTo <= rental_data.dateFrom:
         return JSONResponse(
             status_code=400,
@@ -220,53 +236,55 @@ def create_rental(
             },
         )
 
-    # получение машины по carUid
+    # проверка существования и доступности машины
     car_uid = str(rental_data.carUid)
     try:
-        try:
-            car = call_service("GET", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}").json()
-        except HTTPException as exc:
-            if exc.status_code == 404:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "message": "Validation error",
-                        "errors": [{"field": "carUid", "error": "Car not found"}],
-                    },
-                )
-            raise
+        car = call_service("GET", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}", service_name="Car Service").json()
+        # проверка на доступность машины для аренды
+        if not car["available"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "Validation error",
+                    "errors": [{"field": "carUid", "error": "Car is not available"}],
+                },
+            )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "Validation error",
+                    "errors": [{"field": "carUid", "error": "Car not found"}],
+                },
+            )
+        raise
 
-        # попытка зарезервировать автомобиль
-        try:
-            call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}/reserve")
-        except HTTPException as exc:
-            if exc.status_code in (404, 409):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "message": "Validation error",
-                        "errors": [{"field": "carUid", "error": str(exc.detail)}],
-                    },
-                )
-            raise
+    # попытка зарезервировать автомобиль
+    try:
+        call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}/reserve", service_name="Car Service")
+    except HTTPException as exc:
+        if exc.status_code in (404, 409):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "Validation error",
+                    "errors": [{"field": "carUid", "error": str(exc.detail)}],
+                },
+            )
+        raise
 
-        rental_uid = uuid4()
-        payment_uid = uuid4()
-        rental_days = (rental_data.dateTo - rental_data.dateFrom).days
-        price = car["price"] * rental_days
+    rental_uid = uuid4()
+    payment_uid = uuid4()
+    rental_days = (rental_data.dateTo - rental_data.dateFrom).days
+    price = car["price"] * rental_days
 
-        # запись в сервис оплаты
-        payment_response = call_service(
-            "POST",
-            f"{PAYMENT_SERVICE_URL}/internal/payments",
-            params={"payment_uid": str(payment_uid), "price": price},
-        )
-        payment = payment_response.json()
-
-        # запись в сервис аренды
+    # попытка записи в сервис аренды
+    try:
         rental_response = call_service(
             "POST",
             f"{RENTAL_SERVICE_URL}/api/v1/rental",
+            service_name="Rental Service",
             headers={"X-User-Name": x_user_name},
             json={
                 "rentalUid": str(rental_uid),
@@ -279,9 +297,29 @@ def create_rental(
         )
         rental = rental_response.json()
     except HTTPException:
+        # откат предыдущих операций
+        call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}/release", service_name="Car Service")
         raise
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail="A dependent service is unavailable") from exc
+
+    # попытка записи в сервис оплаты
+    try:
+        payment_response = call_service(
+            "POST",
+            f"{PAYMENT_SERVICE_URL}/internal/payments",
+            service_name="Payment Service",
+            params={"payment_uid": str(payment_uid), "price": price},
+        )
+        payment = payment_response.json()
+    except HTTPException:
+        # откат предыдущих операций
+        call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{car_uid}/release", service_name="Car Service")
+        call_service(
+            "DELETE",
+            f"{RENTAL_SERVICE_URL}/api/v1/rental/{rental_uid}",
+            service_name="Rental Service",
+            headers={"X-User-Name": x_user_name},
+        )
+        raise
 
     return {
         "rentalUid": str(rental["rentalUid"]),
@@ -297,6 +335,7 @@ def create_rental(
 @app.get(
     "/api/v1/rental/{rentalUid}",
     response_model=RentalResponse,
+    response_model_exclude_none=True,
     responses={404: {"model": ErrorResponse, "description": "Аренда не найдена"}},
     summary="Информация по конкретной аренде пользователя",
     tags=["Gateway API"],
@@ -308,6 +347,7 @@ def get_rental_by_uid(
     rental_response = call_service(
         "GET",
         f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}",
+        service_name="Rental Service",
         headers={"X-User-Name": x_user_name},
     )
     return build_rental_response(rental_response.json())
@@ -329,22 +369,38 @@ def cancel_rental(
     rentalUid: UUID,
     x_user_name: str = Header(..., alias="X-User-Name"),
 ) -> Response:
+    # поиск информации об аренде
     rental = call_service(
         "GET",
         f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}",
+        service_name="Rental Service",
         headers={"X-User-Name": x_user_name},
     ).json()
-    call_service(
-        "POST",
-        f"{PAYMENT_SERVICE_URL}/internal/payments/cancel",
-        params={"payment_uid": rental["paymentUid"]},
-    )
-    call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{rental['carUid']}/release")
-    call_service(
-        "DELETE",
-        f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}",
-        headers={"X-User-Name": x_user_name},
-    )
+
+    # снятие занятости с авто
+    call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{rental['carUid']}/release", service_name="Car Service")
+
+    # отмена аренды и оплаты ретраится в очереди (успех отдаётся сразу)
+    try:
+        call_service(
+            "DELETE",
+            f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}",
+            service_name="Rental Service",
+            headers={"X-User-Name": x_user_name},
+        )
+    except HTTPException:
+        retry_cancel_rental(rentalUid, x_user_name)
+
+    try:
+        call_service(
+            "POST",
+            f"{PAYMENT_SERVICE_URL}/internal/payments/cancel",
+            service_name="Payment Service",
+            params={"payment_uid": rental["paymentUid"]},
+        )
+    except HTTPException:
+        retry_cancel_payment(rental["paymentUid"])
+
     return Response(status_code=204)
 
 
@@ -367,14 +423,21 @@ def finish_rental(
     rental = call_service(
         "GET",
         f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}",
+        service_name="Rental Service",
         headers={"X-User-Name": x_user_name},
     ).json()
-    call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{rental['carUid']}/release")
-    call_service(
-        "POST",
-        f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}/finish",
-        headers={"X-User-Name": x_user_name},
-    )
+    call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{rental['carUid']}/release", service_name="Car Service")
+    try:
+        call_service(
+            "POST",
+            f"{RENTAL_SERVICE_URL}/api/v1/rental/{rentalUid}/finish",
+            service_name="Rental Service",
+            headers={"X-User-Name": x_user_name},
+        )
+    except HTTPException:
+        # откат предыдущих операций
+        call_service("POST", f"{CAR_SERVICE_URL}/internal/cars/{rental['carUid']}/reserve", service_name="Car Service")
+        raise
     return Response(status_code=204)
 
 
