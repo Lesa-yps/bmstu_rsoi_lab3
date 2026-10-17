@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from datetime import date
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -20,6 +22,12 @@ app = FastAPI(
 CAR_SERVICE_URL = os.getenv("CAR_SERVICE_URL", "http://car-service:8070")
 RENTAL_SERVICE_URL = os.getenv("RENTAL_SERVICE_URL", "http://rental-service:8060")
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8050")
+
+CIRCUIT_BREAKER_FAILURE_LIMIT = 3
+CIRCUIT_BREAKER_WINDOW_SIZE = 5
+CIRCUIT_BREAKER_RESET_TIMEOUT = 10
+_circuit_breakers: dict[str, dict[str, Any]] = {}
+_circuit_breaker_lock = threading.Lock()
 
 
 class CreateRentalRequest(BaseModel):
@@ -113,10 +121,53 @@ async def handle_http_error(request: Request, exc: HTTPException) -> JSONRespons
 
 
 def call_service(method: str, url: str, service_name: str = "A dependent service", **kwargs: Any) -> requests.Response:
+    is_get = method.upper() == "GET"
+
+    if is_get:
+        with _circuit_breaker_lock:
+            state = _circuit_breakers.setdefault(
+                service_name,
+                {"results": [], "start_opened_time": None, "probe_in_progress": False},
+            )
+            if len(state["results"]) >= CIRCUIT_BREAKER_WINDOW_SIZE:
+                state["results"] = state["results"][-max(1, CIRCUIT_BREAKER_WINDOW_SIZE-1):]
+            start_opened_time = state["start_opened_time"]
+            if start_opened_time is not None:
+                if time.monotonic() - start_opened_time < CIRCUIT_BREAKER_RESET_TIMEOUT or state["probe_in_progress"]:
+                    raise HTTPException(status_code=503, detail=f"{service_name} unavailable")
+                state["probe_in_progress"] = True
+
     try:
         response = requests.request(method, url, timeout=5, **kwargs)
     except requests.RequestException as exc:
+        if is_get:
+            with _circuit_breaker_lock:
+                state = _circuit_breakers[service_name]
+                state["probe_in_progress"] = False
+                if state["start_opened_time"] is None:
+                    state["results"].append(False)
+                    if (state["results"]).count(False) >= CIRCUIT_BREAKER_FAILURE_LIMIT:
+                        state["start_opened_time"] = time.monotonic()
+                        state["results"].clear()
         raise HTTPException(status_code=503, detail=f"{service_name} unavailable") from exc
+    finally:
+        if is_get:
+            with _circuit_breaker_lock:
+                state = _circuit_breakers[service_name]
+                state["probe_in_progress"] = False
+
+    if is_get:
+        with _circuit_breaker_lock:
+            state = _circuit_breakers[service_name]
+            if response.status_code >= 500:
+                if state["start_opened_time"] is None:
+                    state["results"].append(False)
+                    if (state["results"]).count(False) >= CIRCUIT_BREAKER_FAILURE_LIMIT:
+                        state["start_opened_time"] = time.monotonic()
+                        state["results"].clear()
+            else:
+                state["start_opened_time"] = None
+                state["results"].append(True)
 
     if response.status_code >= 400:
         try:
