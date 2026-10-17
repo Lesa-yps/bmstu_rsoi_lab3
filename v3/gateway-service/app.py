@@ -23,8 +23,8 @@ CAR_SERVICE_URL = os.getenv("CAR_SERVICE_URL", "http://car-service:8070")
 RENTAL_SERVICE_URL = os.getenv("RENTAL_SERVICE_URL", "http://rental-service:8060")
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8050")
 
-CIRCUIT_BREAKER_FAILURE_LIMIT = 3
 CIRCUIT_BREAKER_WINDOW_SIZE = 5
+CIRCUIT_BREAKER_WINDOW_SECONDS = 180
 CIRCUIT_BREAKER_RESET_TIMEOUT = 10
 _circuit_breakers: dict[str, dict[str, Any]] = {}
 _circuit_breaker_lock = threading.Lock()
@@ -120,6 +120,15 @@ async def handle_http_error(request: Request, exc: HTTPException) -> JSONRespons
     return JSONResponse(status_code=exc.status_code, content={"message": exc.detail})
 
 
+# запись таймстемпа ошибки; перевод Circuit Breaker в открытое состояние, если окно ошибок плотное по времени
+def _record_failure(state: dict) -> None:
+    state["failed_results_time"].append(time.monotonic())
+    if (len(state["failed_results_time"]) == CIRCUIT_BREAKER_WINDOW_SIZE)\
+        and (state["failed_results_time"][-1] - state["failed_results_time"][0] < CIRCUIT_BREAKER_WINDOW_SECONDS):
+        state["start_opened_time"] = time.monotonic()
+        state["failed_results_time"].clear()
+
+
 def call_service(method: str, url: str, service_name: str = "A dependent service", **kwargs: Any) -> requests.Response:
     is_get = method.upper() == "GET"
 
@@ -127,10 +136,10 @@ def call_service(method: str, url: str, service_name: str = "A dependent service
         with _circuit_breaker_lock:
             state = _circuit_breakers.setdefault(
                 service_name,
-                {"results": [], "start_opened_time": None, "probe_in_progress": False},
+                {"failed_results_time": [], "start_opened_time": None, "probe_in_progress": False},
             )
-            if len(state["results"]) >= CIRCUIT_BREAKER_WINDOW_SIZE:
-                state["results"] = state["results"][-max(1, CIRCUIT_BREAKER_WINDOW_SIZE-1):]
+            if len(state["failed_results_time"]) >= CIRCUIT_BREAKER_WINDOW_SIZE:
+                state["failed_results_time"] = state["failed_results_time"][-max(1, CIRCUIT_BREAKER_WINDOW_SIZE-1):]
             start_opened_time = state["start_opened_time"]
             if start_opened_time is not None:
                 if time.monotonic() - start_opened_time < CIRCUIT_BREAKER_RESET_TIMEOUT or state["probe_in_progress"]:
@@ -145,10 +154,8 @@ def call_service(method: str, url: str, service_name: str = "A dependent service
                 state = _circuit_breakers[service_name]
                 state["probe_in_progress"] = False
                 if state["start_opened_time"] is None:
-                    state["results"].append(False)
-                    if (state["results"]).count(False) >= CIRCUIT_BREAKER_FAILURE_LIMIT:
-                        state["start_opened_time"] = time.monotonic()
-                        state["results"].clear()
+                    _record_failure(state)
+                    
         raise HTTPException(status_code=503, detail=f"{service_name} unavailable") from exc
     finally:
         if is_get:
@@ -159,15 +166,11 @@ def call_service(method: str, url: str, service_name: str = "A dependent service
     if is_get:
         with _circuit_breaker_lock:
             state = _circuit_breakers[service_name]
-            if response.status_code >= 500:
-                if state["start_opened_time"] is None:
-                    state["results"].append(False)
-                    if (state["results"]).count(False) >= CIRCUIT_BREAKER_FAILURE_LIMIT:
-                        state["start_opened_time"] = time.monotonic()
-                        state["results"].clear()
-            else:
-                state["start_opened_time"] = None
-                state["results"].append(True)
+            if state["start_opened_time"] is None:
+                if response.status_code >= 500:
+                    _record_failure(state)
+                else:
+                    state["start_opened_time"] = None
 
     if response.status_code >= 400:
         try:
